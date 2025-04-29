@@ -3,7 +3,7 @@
 This project implements a **parallel dynamic Single-Source Shortest Paths (SSSP) algorithm** using:
 
 - MPI (inter-node parallelism)
-- OpenMP / OpenCL (intra-node parallelism)
+- OpenMP (intra-node parallelism)
 - METIS (graph partitioning)
 - Real public graph datasets
 
