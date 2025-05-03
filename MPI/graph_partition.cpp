@@ -1,4 +1,5 @@
 #include <iostream>
+#include <algorithm>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -16,7 +17,8 @@ using namespace std;
 
 bool GraphPartition::loadGraph(const std::string& filename, 
                              std::vector<idx_t>& xadj, 
-                             std::vector<idx_t>& adjncy) {
+                             std::vector<idx_t>& adjncy,
+                             int& total_edges) {
     std::ifstream in(filename);
     if (!in.is_open()) {
         std::cerr << "Error: Could not open file " << filename << std::endl;
@@ -68,6 +70,7 @@ bool GraphPartition::loadGraph(const std::string& filename,
                  << ", got " << adjncy.size() << std::endl;
         return false;
     }
+    total_edges = edges;
 
     return true;
 }
@@ -76,7 +79,8 @@ bool GraphPartition::loadGraph(const std::string& filename,
 void GraphPartition::partitionGraph(const std::vector<idx_t>& xadj,
                                   const std::vector<idx_t>& adjncy,
                                   int num_parts,
-                                  std::vector<idx_t>& partitions) {
+                                  std::vector<idx_t>& partitions,
+                                  int& total_edges) {
     idx_t nvtxs = xadj.size() - 1;
     cout << "# of nodes:"<<nvtxs<<endl;
     idx_t size_adj = adjncy.size();
@@ -94,9 +98,9 @@ void GraphPartition::partitionGraph(const std::vector<idx_t>& xadj,
     options[METIS_OPTION_OBJTYPE] = METIS_OBJTYPE_CUT;
     options[METIS_OPTION_NUMBERING] = 0;
 
-    if (adjncy.size() != 2 * 150) {
+    if (adjncy.size() != 2 * total_edges) {
         std::cerr << "ERROR: adjncy size (" << adjncy.size() 
-                << ") != 2 × edges (" << 2 * 150 << ")\n";
+                << ") != 2 × edges (" << 2 * total_edges << ")\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
@@ -353,153 +357,220 @@ void GraphPartitionData::identifyGhostNodes(const std::vector<idx_t>& global_par
     }
 }
 
-// // Updated in graph_partition.cpp
-// void GraphPartition::computeDistributedSSSP(int source_global) {
-//     int world_size, world_rank;
-//     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-//     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+void GraphPartition::computeDistributedSSSP(int source_global, GraphPartitionData& data) {
+    int world_size, world_rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
-//     // Only workers participate in computation
-//     if (world_rank == 0) {
-//         MPI_Finalize();
-//         return;
-//     }
+    const int INF = INT_MAX;
+    const int MAX_ITER = 500;  // safety cap
+    int iter_count = 0;
+    std::unordered_map<int, int> last_sent_ghost_distance;
 
-//     DistributedSSSP sssp;
-//     std::unordered_map<idx_t, idx_t> global_to_local;
+    int local_updated = 1;  // use 0 or 1 explicitly
+    int global_updated = 1;
 
-//     // Phase 1: Build local data structures
-//     idx_t node_count;
-//     MPI_Recv(&node_count, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-//     sssp.local_nodes.resize(node_count);
-//     sssp.local_distances.resize(node_count, INT_MAX);
-    
-//     // Receive node data and identify ghost nodes
-//     for (idx_t i = 0; i < node_count; i++) {
-//         idx_t global_node;
-//         MPI_Recv(&global_node, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-//         global_to_local[global_node] = i;
-//         sssp.local_nodes[i] = global_node;
+    bool is_active = (world_rank != 0);
+    if (!is_active) {
+        local_updated = 0;
+        std::cout << "[Root] Participating passively in SSSP to support MPI_Allreduce.\n";
+    }
 
-//         idx_t edge_count;
-//         MPI_Recv(&edge_count, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-//         std::vector<idx_t> edges(edge_count);
-//         MPI_Recv(edges.data(), edge_count, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-//         // Identify ghost nodes (cross-partition edges)
-//         for (idx_t neighbor : edges) {
-//             int neighbor_rank = partitions[neighbor] + 1; // partitions are 0-based
-//             if (neighbor_rank != world_rank) {
-//                 sssp.ghost_nodes[neighbor] = neighbor_rank;
-//                 sssp.ghost_edges[neighbor_rank].push_back(neighbor);
-//             }
-//         }
-//     }
+    std::vector<int> local_dist(data.local_nodes.size(), INF);
 
-//     // Phase 2: Initialize SSSP
-//     if (partitions[source_global-1] == world_rank-1) { // Check if source is local
-//         auto it = global_to_local.find(source_global-1);
-//         if (it != global_to_local.end()) {
-//             sssp.local_distances[it->second] = 0;
-//         }
-//     }
+    auto it = data.global_to_local.find(source_global);
+    if (it != data.global_to_local.end()) {
+        local_dist[it->second] = 0;
+        std::cout << "[Rank " << world_rank << "] Initializing source node " << source_global << " with dist 0.\n";
+    }
 
-//     // Phase 3: Distributed Bellman-Ford
-//     bool updated = true;
-//     for (int iter = 0; iter < partitions.size() && updated; iter++) {
-//         updated = false;
-        
-//         // Process local edges
-//         for (size_t i = 0; i < sssp.local_nodes.size(); i++) {
-//             idx_t global_node = sssp.local_nodes[i];
-//             idx_t start = xadj[global_node];
-//             idx_t end = xadj[global_node+1];
-            
-//             for (idx_t j = start; j < end; j++) {
-//                 idx_t neighbor = adjncy[j];
-//                 int weight = 1; // Assuming unweighted
 
-//                 if (partitions[neighbor] == world_rank-1) { // Local neighbor
-//                     auto local_neighbor = global_to_local[neighbor];
-//                     if (sssp.local_distances[i] + weight < sssp.local_distances[local_neighbor]) {
-//                         sssp.local_distances[local_neighbor] = sssp.local_distances[i] + weight;
-//                         updated = true;
-//                     }
-//                 } else { // Ghost neighbor
-//                     int owner_rank = partitions[neighbor] + 1;
-//                     int update_data[2] = {neighbor, sssp.local_distances[i] + weight};
-//                     MPI_Send(update_data, 2, MPI_INT, owner_rank, 0, MPI_COMM_WORLD);
-//                 }
-//             }
-//         }
+    while (global_updated) {
 
-//         // Process incoming updates
-//         MPI_Status status;
-//         int flag;
-//         do {
-//             MPI_Iprobe(MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &flag, &status);
-//             if (flag) {
-//                 int update_data[2];
-//                 MPI_Recv(update_data, 2, MPI_INT, status.MPI_SOURCE, 0, MPI_COMM_WORLD, &status);
-//                 idx_t global_node = update_data[0];
-//                 int new_dist = update_data[1];
-                
-//                 if (global_to_local.count(global_node)) {
-//                     idx_t local_node = global_to_local[global_node];
-//                     if (new_dist < sssp.local_distances[local_node]) {
-//                         sssp.local_distances[local_node] = new_dist;
-//                         updated = true;
-//                     }
-//                 }
-//             }
-//         } while (flag);
+        if(is_active){
+          
+            iter_count++;
+            if (iter_count > MAX_ITER) {
+                std::cerr << "[Rank " << world_rank << "] Exceeded max iterations! Breaking.\n";
+                break;
+            }
 
-//         // Global convergence check (workers only)
-//         int global_updated;
-//         MPI_Allreduce(&updated, &global_updated, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-//         updated = global_updated;
-//     }
+            local_updated = 0;
+            std::cout << "[Rank " << world_rank << "] Iteration " << iter_count << " started.\n";
 
-//     // Phase 4: Result collection (optional)
-//     if (world_rank == 1) { // Designate rank 1 as gather node
-//         std::vector<int> global_distances(partitions.size(), INT_MAX);
-        
-//         // Include own results first
-//         for (size_t i = 0; i < sssp.local_nodes.size(); i++) {
-//             global_distances[sssp.local_nodes[i]] = sssp.local_distances[i];
-//         }
+            // Step 1: Local relaxation
+            for (size_t u = 0; u < data.local_nodes.size(); ++u) {
+                int u_dist = local_dist[u];
+                if (u_dist == INF) continue;
 
-//         // Receive from other workers
-//         for (int rank = 2; rank < world_size; rank++) {
-//             int node_count;
-//             MPI_Recv(&node_count, 1, MPI_INT, rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            
-//             std::vector<idx_t> nodes(node_count);
-//             std::vector<int> dists(node_count);
-//             MPI_Recv(nodes.data(), node_count, MPI_INT, rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-//             MPI_Recv(dists.data(), node_count, MPI_INT, rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            
-//             for (int i = 0; i < node_count; i++) {
-//                 if (dists[i] < global_distances[nodes[i]]) {
-//                     global_distances[nodes[i]] = dists[i];
-//                 }
-//             }
-//         }
+                int start = data.xadj[u];
+                int end = data.xadj[u + 1];
 
-//         // Print results
-//         std::cout << "Final SSSP distances from node " << source_global << ":\n";
-//         for (size_t i = 0; i < global_distances.size(); i++) {
-//             if (global_distances[i] != INT_MAX) {
-//                 std::cout << "Node " << i+1 << ": " << global_distances[i] << "\n";
-//             }
-//         }
-//     } else if (world_rank > 1) {
-//         // Send results to rank 1
-//         MPI_Send(&node_count, 1, MPI_INT, 1, 0, MPI_COMM_WORLD);
-//         MPI_Send(sssp.local_nodes.data(), node_count, MPI_INT, 1, 0, MPI_COMM_WORLD);
-//         MPI_Send(sssp.local_distances.data(), node_count, MPI_INT, 1, 0, MPI_COMM_WORLD);
-//     }
-//     MPI_Finalize();
-// }
+                for (int i = start; i < end; ++i) {
+                    int v_global = data.adjncy[i];
+
+                    if (data.global_to_local.count(v_global)) {
+                        int v_local = data.global_to_local[v_global];
+                        if (u_dist + 1 < local_dist[v_local]) {
+                            std::cout << "[Rank " << world_rank << "] Relaxing local edge " << data.local_nodes[u]
+                                    << " → " << v_global << ", updating dist " << local_dist[v_local]
+                                    << " → " << u_dist + 1 << "\n";
+                            local_dist[v_local] = u_dist + 1;
+                            local_updated = 1;
+
+                            std::cout << "[Rank " << world_rank << "] Iteration " << iter_count 
+                            << ": local_updated = " << local_updated << "\n";
+
+                        }
+                    } else {
+                        int target_rank = data.ghost_nodes[v_global];
+
+                        // Check if we’ve ever sent this value before
+                        if (data.global_to_local.count(v_global) == 0) {
+                            // Only send if this is a genuine new better distance
+                            static std::unordered_map<int, int> last_sent_ghost_distance;
+
+                            if (!last_sent_ghost_distance.count(v_global) || last_sent_ghost_distance[v_global] > u_dist + 1) {
+
+                                int message[2] = {v_global, u_dist + 1};
+                                MPI_Send(message, 2, MPI_INT, target_rank, 0, MPI_COMM_WORLD);
+                                last_sent_ghost_distance[v_global] = u_dist + 1;
+
+                                std::cout << "[Rank " << world_rank << "] ✅ Sent ghost update for node " << v_global
+                                        << " to rank " << target_rank << " with dist " << message[1] << "\n";
+                            } else {
+                                std::cout << "[Rank " << world_rank << "] ❌ Skipped ghost resend to " << v_global
+                                        << " (dist = " << u_dist + 1 << ") — already sent\n";
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Step 2: Receive ghost updates
+            int flag;
+            MPI_Status status;
+            int recv_count = 0;
+
+            while (true) {
+                int flag = 0;
+                MPI_Iprobe(MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &flag, &status);
+                if (!flag) break;
+
+                int recv_data[2];
+                MPI_Recv(recv_data, 2, MPI_INT, status.MPI_SOURCE, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+                int v_global = recv_data[0];
+                int new_dist = recv_data[1];
+
+                if (data.global_to_local.count(v_global)) {
+                    int v_local = data.global_to_local[v_global];
+
+                    if (new_dist < local_dist[v_local]) {
+                        std::cout << "[Rank " << world_rank << "] Received ghost update for node " << v_global
+                                << " from rank " << status.MPI_SOURCE
+                                << ", updating dist " << local_dist[v_local] << " → " << new_dist << "\n";
+                        local_dist[v_local] = new_dist;
+                        local_updated = 1;
+                        recv_count++;
+                    }
+                }
+            }
+
+            std::cout << "[Rank " << world_rank << "] Finished iteration " << iter_count
+                        << " with " << recv_count << " ghost messages.\n";
+        }
+
+        std::cout << "[Rank " << world_rank << "] Iteration " << iter_count
+          << " local_updated=" << local_updated << "\n";
+
+        MPI_Allreduce(&local_updated, &global_updated, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+        cout<<"Rank:"<<world_rank<<"Stuck here again\n";
+       
+        std::cout << "[Rank " << world_rank << "] Iteration " << iter_count
+                << " completed: local_updated=" << local_updated
+                << ", global_updated=" << global_updated<<endl;
+                //<< ", recv_count=" << recv_count << "\n";
+    }
+
+    std::cout << "\n[Rank " << world_rank << "] Final SSSP distances:\n";
+    for (size_t i = 0; i < data.local_nodes.size(); ++i) {
+        int g = data.local_nodes[i];
+        if (local_dist[i] == INF)
+            std::cout << "  Node " << g << ": INF\n";
+        else
+            std::cout << "  Node " << g << ": " << local_dist[i] << "\n";
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////////////
+    //////////////////////////////////////////////////////////////////////////////////////////
+
+    std::vector<std::tuple<int, int, int>> local_results;
+
+    for (size_t i = 0; i < data.local_nodes.size(); ++i) {
+        int g = data.local_nodes[i]; // global ID
+        int d = (local_dist[i] == INF) ? -1 : local_dist[i];
+        int p = -1; // we aren't storing parent info yet — optional
+        local_results.emplace_back(g, d, p);
+    }
+
+    int local_count = local_results.size();
+    std::vector<int> flat_data; // u, dist, parent triples
+    for (const auto& [u, d, p] : local_results) {
+        flat_data.push_back(u);
+        flat_data.push_back(d);
+        flat_data.push_back(p);
+    }
+
+    if (world_rank == 0) {
+        std::vector<std::vector<int>> all_data(world_size);
+        all_data[0] = flat_data;
+
+        for (int r = 1; r < world_size; ++r) {
+            int count;
+            MPI_Recv(&count, 1, MPI_INT, r, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            std::vector<int> buffer(count);
+            MPI_Recv(buffer.data(), count, MPI_INT, r, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            all_data[r] = buffer;
+        }
+
+        // Combine and write to file
+        std::vector<std::tuple<int, int, int>> combined_results;
+        for (int r = 0; r < world_size; ++r) {
+            const std::vector<int>& buf = all_data[r];
+            for (size_t i = 0; i < buf.size(); i += 3) {
+                combined_results.emplace_back(buf[i]+1, buf[i+1], buf[i+2]); // u, dist, parent
+            }
+        }
+
+        // Sort by node ID (u)
+        std::sort(combined_results.begin(), combined_results.end(),
+                [](const auto& a, const auto& b) {
+                    return std::get<0>(a) < std::get<0>(b);
+                });
+
+        // Write to file
+        std::ofstream out("sssp_result.txt");
+        if (!out.is_open()) {
+            std::cerr << "Failed to open output file!\n";
+            return;
+        }
+
+        //out << "u\tdist\tparent\n";
+        for (const auto& [u, d, p] : combined_results) {
+            out << u << "\t" << d << "\t" << p << "\n";
+        }
+        out.close();
+        std::cout << "[Rank 0] Wrote sorted SSSP output to sssp_result.txt\n";
+
+    } else {
+        int count = flat_data.size();
+        MPI_Send(&count, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+        MPI_Send(flat_data.data(), count, MPI_INT, 0, 1, MPI_COMM_WORLD);
+    }
+
+}
 

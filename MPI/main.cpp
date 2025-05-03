@@ -11,6 +11,7 @@ int main(int argc, char* argv[]) {
     
     GraphPartitionData partition_data;
     std::vector<idx_t> xadj, adjncy, partitions;
+    int total_edges=0;
     
     if (world_rank == 0) {
         if (argc < 2) {
@@ -26,10 +27,10 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        if (!GraphPartition::loadGraph(argv[1], xadj, adjncy)) {
+        if (!GraphPartition::loadGraph(argv[1], xadj, adjncy,total_edges)) {
             return 1;
         }
-        GraphPartition::partitionGraph(xadj, adjncy, num_parts, partitions);
+        GraphPartition::partitionGraph(xadj, adjncy, num_parts, partitions, total_edges);
     }
 
     // Broadcast partition mapping to all processes
@@ -47,14 +48,24 @@ int main(int argc, char* argv[]) {
     GraphPartition::distributePartitions(argc, argv, xadj, adjncy, partitions, partition_data);
 
     MPI_Barrier(MPI_COMM_WORLD);
-
-    // if (world_rank == 0) {
-    //     int source_global = 1; // Set source node
-    //     computeDistributedSSSP(source_global, partition_data);
-    // } else {
-    //     computeDistributedSSSP(-1, partition_data);
-    // }
+    int source_global = 1;
     
+    GraphPartition::computeDistributedSSSP(source_global, partition_data);
+    
+    MPI_Barrier(MPI_COMM_WORLD);
+    int flag;
+    MPI_Status status;
+    do {
+        MPI_Iprobe(MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &flag, &status);
+        if (flag) {
+            int dummy[2];
+            MPI_Recv(dummy, 2, MPI_INT, status.MPI_SOURCE, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            std::cout << "[Rank " << world_rank << "] Drained late ghost message from rank " << status.MPI_SOURCE << "\n";
+        }
+    } while (flag);
+
+    MPI_Barrier(MPI_COMM_WORLD); // safe to finalize now
+
     MPI_Finalize();
     return 0;
 }
