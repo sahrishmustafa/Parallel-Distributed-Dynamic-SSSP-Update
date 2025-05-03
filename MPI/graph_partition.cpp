@@ -166,34 +166,39 @@ void GraphPartition::partitionGraph(const std::vector<idx_t>& xadj,
 }
 
 
+// Updated distributePartitions in graph_partition.cpp
 void GraphPartition::distributePartitions(int argc, char* argv[],
                                         const std::vector<idx_t>& xadj,
                                         const std::vector<idx_t>& adjncy,
-                                        const std::vector<idx_t>& partitions) {
-
+                                        const std::vector<idx_t>& partitions,
+                                        GraphPartitionData& partition_data) {
     int world_size, world_rank;
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
-    MPI_Datatype mpi_idx_type = GetMPI_IDX_T();
-    if (mpi_idx_type == MPI_DATATYPE_NULL) {
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
-    }
+    partition_data.my_rank = world_rank;
+    partition_data.partitions = partitions;
 
     if (world_rank == 0) {
-        // Master process - distribute based on pre-computed partitions
+        // MASTER PROCESS - ONLY DISTRIBUTES DATA
+        std::cout << "\nMASTER (Rank 0) - Distributing partitions using pre-generated files\n";
+        std::cout << "Total partitions to distribute: " << world_size-1 << "\n";
+
+        // Verify partition files exist
         for (int dest = 1; dest < world_size; dest++) {
-            // Read partition file for this rank
+            std::string part_file = "pre-parts/part_" + std::to_string(dest-1) + ".txt";
+            if (!std::ifstream(part_file)) {
+                std::cerr << "Error: Partition file missing: " << part_file << std::endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+        }
+
+        // Distribute partitions from files
+        for (int dest = 1; dest < world_size; dest++) {
             std::string part_file = "pre-parts/part_" + std::to_string(dest-1) + ".txt";
             std::ifstream in(part_file);
             
-            if (!in.is_open()) {
-                std::cerr << "Error opening partition file: " << part_file << std::endl;
-                MPI_Abort(MPI_COMM_WORLD, 1);
-            }
-
-            // Count nodes in this partition
+            // Count nodes in this partition file
             idx_t node_count = 0;
             std::string line;
             while (std::getline(in, line)) {
@@ -202,57 +207,149 @@ void GraphPartition::distributePartitions(int argc, char* argv[],
             in.clear();
             in.seekg(0);
 
-            // Send node count
-            MPI_Send(&node_count, 1, mpi_idx_type, dest, 0, MPI_COMM_WORLD);
+            std::cout << "Sending partition " << dest-1 << " to Rank " << dest 
+                     << " (" << node_count << " nodes)\n";
 
-            if (node_count > 0) {
+            // Send node count
+            MPI_Send(&node_count, 1, MPI_INT, dest, 0, MPI_COMM_WORLD);
+
+            // Send node data
+            while (std::getline(in, line)) {
+                if (line.find("Node ") != 0) continue;
+                
+                // Parse node info: "Node X (Original ID): Y1 Y2(X) Y3 ..."
+                size_t colon_pos = line.find(":");
+                idx_t global_node = std::stoi(line.substr(5, colon_pos - 5 - 13)) - 1;
+                cout<<"global node:"<<global_node<<" from file"<<dest-1;
+                
+                // Get edges from original graph data
+                idx_t start = xadj[global_node];
+                idx_t end = xadj[global_node+1];
+                idx_t edge_count = end - start;
+                
                 // Send node data
-                while (std::getline(in, line)) {
-                    if (line.find("Node ") != 0) continue;
-                    
-                    // Parse node info
-                    size_t colon_pos = line.find(":");
-                    idx_t node = std::stoi(line.substr(5, colon_pos - 5)) - 1; // Convert to 0-based
-                    
-                    // Send node ID
-                    MPI_Send(&node, 1, mpi_idx_type, dest, 0, MPI_COMM_WORLD);
-                    
-                    // Find edges in original graph
-                    idx_t start = xadj[node];
-                    idx_t end = xadj[node+1];
-                    idx_t edge_count = end - start;
-                    
-                    // Send edges
-                    MPI_Send(&edge_count, 1, mpi_idx_type, dest, 0, MPI_COMM_WORLD);
-                    MPI_Send(&adjncy[start], edge_count, mpi_idx_type, dest, 0, MPI_COMM_WORLD);
-                }
+                MPI_Send(&global_node, 1, MPI_INT, dest, 0, MPI_COMM_WORLD);
+                MPI_Send(&edge_count, 1, MPI_INT, dest, 0, MPI_COMM_WORLD);
+                MPI_Send(&adjncy[start], edge_count, MPI_INT, dest, 0, MPI_COMM_WORLD);
+
+                std::cout << "  Sent node " << global_node << " with " << edge_count << " edges\n";
             }
             in.close();
         }
+        std::cout << "MASTER: Distribution complete. Rank 0 holds no graph data.\n";
     } else {
-        // Worker processes - receive and print only
+        // WORKER PROCESSES - RECEIVE AND STORE THEIR PARTITION
+        std::ofstream outfile("verified" + std::to_string(world_rank) + ".txt");
+        if (!outfile.is_open()) {
+            std::cerr << "Error creating verification file for rank " << world_rank << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        outfile << "WORKER (Rank " << world_rank << ") - Partition Verification Data\n";
+        
+        // Receive node count
         idx_t node_count;
-        MPI_Recv(&node_count, 1, mpi_idx_type, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&node_count, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        outfile << "Total nodes received: " << node_count << "\n\n";
+
+        // Initialize data structures
+        partition_data.local_nodes.resize(node_count);
+        partition_data.xadj.resize(node_count + 1);
+        partition_data.xadj[0] = 0;
         
-        std::cout << "Rank " << world_rank << " received " << node_count << " nodes\n";
-        
+        // Receive nodes and write to file
         for (idx_t i = 0; i < node_count; i++) {
-            idx_t node;
-            MPI_Recv(&node, 1, mpi_idx_type, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            idx_t global_node;
+            MPI_Recv(&global_node, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            partition_data.local_nodes[i] = global_node;
+            partition_data.global_to_local[global_node] = i;
             
             idx_t edge_count;
-            MPI_Recv(&edge_count, 1, mpi_idx_type, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(&edge_count, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             
             std::vector<idx_t> edges(edge_count);
-            MPI_Recv(edges.data(), edge_count, mpi_idx_type, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Recv(edges.data(), edge_count, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             
-            // Print simple node info
-            std::cout<<"Rank "<< world_rank << " Node " << node + 1 << " has " << edge_count << " edges: ";
-            for (idx_t edge : edges) {
-                std::cout << edge + 1 << " "; // Show 1-based
+            // Store in CSR format
+            partition_data.adjncy.insert(partition_data.adjncy.end(), edges.begin(), edges.end());
+            partition_data.xadj[i+1] = partition_data.xadj[i] + edge_count;
+
+            // Write node details to file
+            outfile << "Node " << global_node << " (local index " << i << ")\n";
+            outfile << "  Edge count: " << edge_count << "\n";
+            outfile << "  Edges: ";
+            for (size_t j = 0; j < edges.size(); j++) {
+                outfile << edges[j];
+                if (j < edges.size()-1) outfile << ", ";
             }
-            std::cout << "\n";
+            outfile << "\n\n";
         }
+
+        // Identify ghost nodes
+        partition_data.identifyGhostNodes(partitions);
+        
+        // Write ghost node information
+        outfile << "\nGhost Nodes (" << partition_data.ghost_nodes.size() << " total):\n";
+        for (const auto& entry : partition_data.ghost_nodes) {
+            outfile << "  Node " << entry.first << " (owned by Rank " << entry.second << ")\n";
+        }
+
+        // Write CSR structure summary
+        outfile << "\nCSR Structure Summary:\n";
+        outfile << "xadj: [";
+        for (size_t i = 0; i < partition_data.xadj.size(); i++) {
+            outfile << partition_data.xadj[i];
+            if (i < partition_data.xadj.size()-1) outfile << ", ";
+        }
+        outfile << "]\n";
+        
+        outfile << "adjncy: [";
+        for (size_t i = 0; i < partition_data.adjncy.size(); i++) {
+            outfile << partition_data.adjncy[i];
+            if (i < partition_data.adjncy.size()-1) outfile << ", ";
+        }
+        outfile << "]\n";
+
+        // Final summary
+        outfile << "\nPartition Summary:\n";
+        outfile << "  Local nodes: " << node_count << "\n";
+        outfile << "  Ghost nodes: " << partition_data.ghost_nodes.size() << "\n";
+        outfile << "  Total edges: " << partition_data.adjncy.size() << "\n";
+        outfile << "  xadj size: " << partition_data.xadj.size() << "\n";
+        outfile << "  adjncy size: " << partition_data.adjncy.size() << "\n";
+
+        outfile.close();
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (world_rank == 0) {
+        std::cout << "\nAll partitions successfully distributed\n";
+    }
+}
+
+void GraphPartitionData::identifyGhostNodes(const std::vector<idx_t>& global_partitions) {
+    // First pass: identify all ghost nodes
+    for (size_t i = 0; i < local_nodes.size(); i++) {
+        idx_t global_node = local_nodes[i];
+        idx_t start = xadj[i];
+        idx_t end = xadj[i+1];
+        
+        for (idx_t j = start; j < end; j++) {
+            idx_t neighbor = adjncy[j];
+            int neighbor_rank = global_partitions[neighbor] + 1; // partitions are 0-based
+            
+            if (neighbor_rank != my_rank) {
+                ghost_nodes[neighbor] = neighbor_rank;
+            }
+        }
+    }
+    
+    // Second pass: build send maps
+    for (const auto& entry : ghost_nodes) {
+        idx_t node = entry.first;
+        int owner_rank = entry.second;
+        send_map[owner_rank].push_back(node);
     }
 }
 
