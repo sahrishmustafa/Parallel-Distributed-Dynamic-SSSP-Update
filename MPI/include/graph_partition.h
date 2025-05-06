@@ -83,6 +83,12 @@ public:
 
     static void distributeEdgeUpdates(const std::string& filename, std::vector<EdgeUpdate>& local_updates, GraphPartitionData& partition_data);
 
+    static void processDistributedInsertions(GraphPartitionData& data, const std::vector<EdgeUpdate>& insertions) ;
+
+    static void distributeEdgeUpdates_Insertions(const std::string& filename, 
+                                            std::vector<EdgeUpdate>& local_updates,
+                                            GraphPartitionData& partition_data);
+
     static void gatherAndWriteSSSPToFile(const GraphPartitionData& partition_data);
 
 };

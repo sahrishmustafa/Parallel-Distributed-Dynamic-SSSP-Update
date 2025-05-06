@@ -8,11 +8,66 @@
 #include <unordered_set>
 #include <mpi.h>
 #include <functional>
+#include <set>
+#include <queue>
 #include <climits>
 #include <sstream> 
 #include <sys/stat.h>
 #include <unistd.h>   
 using namespace std;
+
+const int INF = INT_MAX;
+
+void rebuildCSRWithUpdates(GraphPartitionData& partition_data,
+                           const std::vector<std::pair<idx_t, idx_t>>& pending_insertions,
+                           const std::vector<std::pair<idx_t, idx_t>>& pending_deletions,
+                           int world_rank) {
+    int local_vertex_count = partition_data.global_to_local.size();
+    std::vector<std::vector<idx_t>> temp_adj(local_vertex_count);
+
+    // Convert old CSR to temp_adj
+    for (idx_t u = 0; u < local_vertex_count; ++u) {
+        for (idx_t i = partition_data.xadj[u]; i < partition_data.xadj[u + 1]; ++i) {
+            idx_t v = partition_data.adjncy[i];
+            temp_adj[u].push_back(v);
+        }
+    }
+
+    // Apply deletions
+    for (const auto& [global_u, global_v] : pending_deletions) {
+        if (partition_data.global_to_local.count(global_u)) {
+            idx_t local_u = partition_data.global_to_local.at(global_u);
+            auto& neighbors = temp_adj[local_u];
+            neighbors.erase(std::remove(neighbors.begin(), neighbors.end(), global_v), neighbors.end());
+        }
+    }
+
+    // Apply insertions (avoid duplicates)
+    for (const auto& [global_u, global_v] : pending_insertions) {
+        if (partition_data.global_to_local.count(global_u)) {
+            idx_t local_u = partition_data.global_to_local.at(global_u);
+            auto& neighbors = temp_adj[local_u];
+            if (std::find(neighbors.begin(), neighbors.end(), global_v) == neighbors.end()) {
+                neighbors.push_back(global_v);
+            }
+        }
+    }
+
+    // Rebuild CSR
+    partition_data.xadj.clear();
+    partition_data.adjncy.clear();
+    partition_data.xadj.push_back(0);
+    for (const auto& neighbors : temp_adj) {
+        partition_data.adjncy.insert(partition_data.adjncy.end(), neighbors.begin(), neighbors.end());
+        partition_data.xadj.push_back(partition_data.adjncy.size());
+    }
+
+    std::cout << "[Rank " << world_rank << "] CSR rebuilt with insertions and deletions. xadj size: "
+              << partition_data.xadj.size() << ", adjncy size: "
+              << partition_data.adjncy.size() << std::endl;
+}
+
+
 
 
 bool GraphPartition::loadGraph(const std::string& filename, 
@@ -362,14 +417,13 @@ void GraphPartition::computeDistributedSSSP(int source_global, GraphPartitionDat
     ////////////////////////////////
     ////////////////////////////////
 
-    std::ofstream printFile("prints.txt", std::ios::app); // Append mode to combine outputs
-    std::streambuf* originalCoutBuffer = std::cout.rdbuf(); // Save original buffer
-    std::cout.rdbuf(printFile.rdbuf()); // Redirect cout to file
+    // std::ofstream printFile("prints.txt", std::ios::app); // Append mode to combine outputs
+    // std::streambuf* originalCoutBuffer = std::cout.rdbuf(); // Save original buffer
+    // std::cout.rdbuf(printFile.rdbuf()); // Redirect cout to file
 
     ////////////////////////////////
     ////////////////////////////////
 
-    const int INF = INT_MAX;
     const int MAX_ITER = 500;
     int iter_count = 0;
 
@@ -389,7 +443,7 @@ void GraphPartition::computeDistributedSSSP(int source_global, GraphPartitionDat
     auto it = data.global_to_local.find(source_global);
     if (it != data.global_to_local.end()) {
         local_dist[it->second] = 0;
-        parent[it->second] = source_global;  // root points to itself
+        parent[it->second] = -1;  // root points to itself
         std::cout << "[Rank " << world_rank << "] Initializing source node " << source_global << " with dist 0.\n";
     }
 
@@ -526,7 +580,7 @@ void GraphPartition::computeDistributedSSSP(int source_global, GraphPartitionDat
 
         // Combine all partitions
         std::vector<std::tuple<int, int, int>> combined_results;
-        for (int r = 0; r < world_size; ++r) {
+        for (int r = 1; r < world_size; ++r) {
             const std::vector<int>& buf = all_data[r];
             for (size_t i = 0; i < buf.size(); i += 3) {
                 combined_results.emplace_back(buf[i], buf[i+1], buf[i+2]);
@@ -559,7 +613,691 @@ void GraphPartition::computeDistributedSSSP(int source_global, GraphPartitionDat
 
 }
 
+void disconnectSubtree(GraphPartitionData& partition_data, idx_t root_global) {
+    // Get local index of the root
+    auto it = std::find(partition_data.local_nodes.begin(), partition_data.local_nodes.end(), root_global);
+    if (it == partition_data.local_nodes.end()) return;
 
+    idx_t root_local = std::distance(partition_data.local_nodes.begin(), it);
+    std::cout << "[Rank " << partition_data.my_rank << "] root_global: " << root_global
+              << " with distance: " << partition_data.sssp_tree[root_global].distance << std::endl;
+
+    std::unordered_set<idx_t> visited;
+    std::queue<idx_t> q;
+    q.push(root_local);
+    visited.insert(root_local);
+
+    while (!q.empty()) {
+        idx_t u_local = q.front(); q.pop();
+        idx_t u_global = partition_data.local_nodes[u_local];
+
+        std::cout << "[Rank " << partition_data.my_rank << "] Disconnecting u_local: "
+                  << u_local << " (global: " << u_global << "), original distance: "
+                  << partition_data.sssp_tree[u_global].distance << std::endl;
+
+        // Invalidate distance to mark it disconnected
+        partition_data.sssp_tree[u_global].distance = INT_MAX;
+
+        // Traverse only children in the SSSP tree
+        for (idx_t i = partition_data.xadj[u_local]; i < partition_data.xadj[u_local + 1]; ++i) {
+            idx_t neighbor_global = partition_data.adjncy[i];
+
+            // Check if neighbor is local
+            auto it_n = std::find(partition_data.local_nodes.begin(), partition_data.local_nodes.end(), neighbor_global);
+            if (it_n == partition_data.local_nodes.end()) continue;
+
+            idx_t neighbor_local = std::distance(partition_data.local_nodes.begin(), it_n);
+
+            // Ensure neighbor is child of current node in SSSP tree
+            if (partition_data.sssp_tree.count(neighbor_global) &&
+                partition_data.sssp_tree[neighbor_global].parent == u_global &&
+                !visited.count(neighbor_local)) {
+
+                std::cout << "[Rank " << partition_data.my_rank << "] --> Adding child: "
+                          << neighbor_global << " (local: " << neighbor_local << ") to queue" << std::endl;
+
+                q.push(neighbor_local);
+                visited.insert(neighbor_local);
+            }
+        }
+
+        std::cout << "[Rank " << partition_data.my_rank << "] Completed processing u_global: "
+                  << u_global << "\n" << std::endl;
+    }
+
+    std::cout << "[Rank " << partition_data.my_rank << "] ✅ Disconnected subtree rooted at global node "
+              << root_global << std::endl;
+}
+
+
+// Reads updates from file and distributes to relevant ranks
+void GraphPartition::distributeEdgeUpdates(const std::string& filename, std::vector<EdgeUpdate>& local_updates, GraphPartitionData& partition_data) {
+    int world_rank, world_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    if (world_rank == 0) {
+        std::cout << "[Root] Reading updates from file: " << filename << std::endl;
+        std::ifstream infile(filename);
+        std::string line;
+        std::unordered_map<int, std::vector<EdgeUpdate>> updates_by_rank;
+        bool is_insert = false;
+
+        if (!infile.is_open()) {
+            std::cerr << "Error: Could not open file " << filename << std::endl;
+            return;
+        }
+
+        while (std::getline(infile, line)) {
+
+            is_insert = false;
+
+            std::istringstream iss(line);
+            char type;
+            idx_t u, v;
+            int weight = 1; // default
+            iss >> type >> u >> v;
+            cout<<"type:"<<type<<" u:"<<u<<" v:"<<v<<endl;
+            if (type == 'I'){
+                is_insert = true;
+            }     
+
+            EdgeUpdate upd = {u, v, weight, is_insert};
+
+            int part_u = partition_data.partitions[u] + 1;
+            int part_v = partition_data.partitions[v] + 1;
+
+            std::unordered_set<int> target_ranks;
+            target_ranks.insert(part_u);
+            target_ranks.insert(part_v);
+
+            cout<<"part1:"<<part_u<<" part2:"<<part_v<<" size:"<<target_ranks.size()<<endl;
+
+            for (int r : target_ranks) {
+                cout<<"Rank/Partition:"<<r<<" for u:"<<u<<" v:"<<v<<endl;
+                updates_by_rank[r].push_back(upd);
+            }
+        }
+
+        std::cout << "File reading finished!\n";
+
+
+        ////////////////////////////////////////////
+        ////////////////////////////////////////////
+
+        for (int r = 1; r < world_size; ++r) {
+            int count = updates_by_rank[r].size();
+            std::cout << "[Root] Sending " << count << " updates to rank " << r << std::endl;
+            MPI_Send(&count, 1, MPI_INT, r, 100, MPI_COMM_WORLD);
+            if (count > 0) {
+                MPI_Send(updates_by_rank[r].data(), count * sizeof(EdgeUpdate), MPI_BYTE, r, 101, MPI_COMM_WORLD);
+            }
+        }
+    } else {
+        std::cout << "[Rank " << world_rank << "] Waiting for updates from root..." << std::endl;
+        int num_updates;
+        MPI_Recv(&num_updates, 1, MPI_INT, 0, 100, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        local_updates.resize(num_updates);
+        if (num_updates > 0) {
+            MPI_Recv(local_updates.data(), num_updates * sizeof(EdgeUpdate), MPI_BYTE, 0, 101, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        std::cout << "[Rank " << world_rank << "] Received " << num_updates << " updates." << std::endl;
+
+        std::set<idx_t> affected_nodes;
+        std::vector<std::pair<idx_t, idx_t>> pending_insertions;
+        std::vector<std::pair<idx_t, idx_t>> pending_deletions;
+        bool reconnecting = false;
+
+        for (const auto& upd : local_updates) {
+            idx_t u = upd.u;
+            idx_t v = upd.v;
+
+            bool owns_u = partition_data.global_to_local.count(u);
+            bool owns_v = partition_data.global_to_local.count(v);
+
+            std::cout << "[Rank " << world_rank << "] Processing update: "
+                    << (upd.is_insertion ? "Insert" : "Delete") 
+                    << " (" << u << ", " << v << ")" << std::endl;
+
+            if (upd.is_insertion) {
+                if (owns_u) {
+                    pending_insertions.emplace_back(u, v);
+                    std::cout << "[Rank " << world_rank << "] I own u: " << u << std::endl;
+                }
+                if (owns_v) {
+                    pending_insertions.emplace_back(v, u);
+                    std::cout << "[Rank " << world_rank << "] I own v: " << v << std::endl;
+                }
+            } else {
+                // Deletion
+                if (owns_u) {
+                    pending_deletions.emplace_back(u, v);
+                    std::cout << "[Rank " << world_rank << "] I own u for deletion: " << u << std::endl;
+                }
+                if (owns_v) {
+                    pending_deletions.emplace_back(v, u);
+                    std::cout << "[Rank " << world_rank << "] I own v for deletion: " << v << std::endl;
+                }
+
+                // Check if SSSP tree is affected and disconnect subtree
+                // Determine who is the parent and who is the child in the SSSP tree
+                cout<<"Parent of u:"<<partition_data.sssp_tree[upd.u].parent<<endl;
+                cout<<"Parent of v:"<<partition_data.sssp_tree[upd.v].parent<<endl;
+                if (owns_u && partition_data.sssp_tree[upd.u].parent == upd.v) {
+                    reconnecting = true;
+                    disconnectSubtree(partition_data, upd.u);  // u is child → disconnect its subtree
+                    pending_deletions.emplace_back(upd.u, upd.v);
+                    std::cout << "[Rank " << world_rank << "] Deleting edge affected child " << upd.u << "\n";
+                }
+                else if (owns_v && partition_data.sssp_tree[upd.v].parent == upd.u) {
+                    reconnecting = true;
+                    disconnectSubtree(partition_data, upd.v);  // v is child → disconnect its subtree
+                    pending_deletions.emplace_back(upd.v, upd.u);
+                    std::cout << "[Rank " << world_rank << "] Deleting edge affected child " << upd.v << "\n";
+                }
+            }
+
+            // Track any local node as affected
+            if (owns_u) affected_nodes.insert(u);
+            if (owns_v) affected_nodes.insert(v);
+        }
+
+        // Add all disconnected (INF-distance) local nodes to affected_nodes
+        for (const auto& [node, info] : partition_data.sssp_tree) {
+            if (info.distance == INT_MAX) {
+                affected_nodes.insert(node);
+            }
+        }
+        
+        // Rebuild CSR for insertions and deletions
+        if (!pending_insertions.empty() || !pending_deletions.empty()) {
+            rebuildCSRWithUpdates(partition_data, pending_insertions, pending_deletions, world_rank);
+        }
+
+        std::priority_queue<std::pair<int, idx_t>, std::vector<std::pair<int, idx_t>>, std::greater<>> pq;
+        std::unordered_map<idx_t, int> new_distances;
+        std::unordered_set<idx_t> visited;
+
+        // Enqueue affected nodes even if not yet in sssp_tree
+        for (auto node : affected_nodes) {
+            int initial_dist = INT_MAX;
+            if (partition_data.sssp_tree.count(node)) {
+                initial_dist = partition_data.sssp_tree[node].distance;
+            } else {
+                partition_data.sssp_tree[node] = {initial_dist, -1};
+            }
+            pq.push({initial_dist, node});
+            std::cout << "[Rank " << world_rank << "] Enqueued affected node: " << node << " with distance " << initial_dist << std::endl;
+        }
+
+        while (!pq.empty()) {
+            auto [dist, u] = pq.top(); pq.pop();
+            std::cout << "[Rank " << world_rank << "] Processing affected node " << u << " at initial distance " << dist << std::endl;
+
+            if (dist > partition_data.sssp_tree[u].distance) continue;
+
+            auto it = partition_data.global_to_local.find(u);
+            if (it == partition_data.global_to_local.end()) continue;
+
+            idx_t local_idx = it->second;
+            std::cout << "[Rank " << world_rank << "] u: " << u << " local idx: " << local_idx << std::endl;
+
+            // --------- REVERSE RELAXATION: Try to update u using each neighbor v ---------
+            for (idx_t i = partition_data.xadj[local_idx]; i < partition_data.xadj[local_idx + 1]; ++i) {
+                idx_t v = partition_data.adjncy[i];
+                std::cout << "[Rank " << world_rank << "] Checking if u: " << u << " can be updated via v: " << v << std::endl;
+
+                if (!partition_data.sssp_tree.count(v) || partition_data.sssp_tree[v].distance == INT_MAX)
+                    continue;
+
+                int alt = partition_data.sssp_tree[v].distance + 1;
+
+                std::cout << "[Rank " << world_rank << "] Current dist(u): " << partition_data.sssp_tree[u].distance
+                        << ", alt via v: " << alt << std::endl;
+
+                if (alt < partition_data.sssp_tree[u].distance) {
+                    std::cout << "[Rank " << world_rank << "] Updating u: " << u << " via v: " << v
+                            << " with new distance: " << alt << std::endl;
+
+                    partition_data.sssp_tree[u] = {alt, (int)v};
+                    partition_data.sssp_tree[u].distance = alt;
+                    new_distances[u] = alt;
+                    
+                    pq.push({alt, u});
+                }
+            }
+
+            // --------- FORWARD RELAXATION: Update neighbors v from u as usual ---------
+            //if (dist == INT_MAX) continue; // prevent overflow
+            dist = partition_data.sssp_tree[u].distance;
+
+            for (idx_t i = partition_data.xadj[local_idx]; i < partition_data.xadj[local_idx + 1]; ++i) {
+                idx_t v = partition_data.adjncy[i];
+                std::cout << "[Rank " << world_rank << "] u: " << u << " → v: " << v << std::endl;
+
+               int alt = (dist == INT_MAX ? INT_MAX : dist + 1);
+                std::cout << "[Rank " << world_rank << "] old dist(v): " << partition_data.sssp_tree[v].distance
+                        << ", new dist(u's dist +1): " << alt << std::endl;
+
+                if (!partition_data.sssp_tree.count(v) || alt < partition_data.sssp_tree[v].distance) {
+                    std::cout << "[Rank " << world_rank << "] Updating distance for node " << v << " to " << alt << std::endl;
+                    partition_data.sssp_tree[v] = {alt, (int)u};
+                    new_distances[v] = alt;
+                    pq.push({alt, v});
+                }
+            }
+        }
+
+
+        // Propagate updates to ghost node owners
+        for (const auto& [v, new_dist] : new_distances) {
+            if (partition_data.ghost_nodes.count(v)) {
+                int owner = partition_data.ghost_nodes.at(v);
+                std::cout << "[Rank " << world_rank << "] Sending update for ghost node " << v << " to owner rank " << owner << std::endl;
+                MPI_Send(&v, 1, GetMPI_IDX_T(), owner, 200, MPI_COMM_WORLD);
+                MPI_Send(&new_dist, 1, MPI_INT, owner, 201, MPI_COMM_WORLD);
+            }
+        }
+
+        // Receive and process updates from other ranks
+        MPI_Status status;
+        int flag;
+        bool any_update = true;
+
+        while (any_update) {
+            any_update = false;
+
+            while (true) {
+                cout<< "[Rank " << world_rank << "]"<<"Stuck in here\n";
+                MPI_Iprobe(MPI_ANY_SOURCE, 200, MPI_COMM_WORLD, &flag, &status);
+                if (!flag) break;
+                cout<< "[Rank " << world_rank << "]"<<"Probe no work\n";
+
+                idx_t node;
+                int dist;
+                cout<< "[Rank " << world_rank << "]"<<"Blocked at recv\n";
+                MPI_Recv(&node, 1, GetMPI_IDX_T(), status.MPI_SOURCE, 200, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                MPI_Recv(&dist, 1, MPI_INT, status.MPI_SOURCE, 201, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+                std::cout << "[Rank " << world_rank << "] Received ghost update: node " << node << " distance " << dist << std::endl;
+
+                if (!partition_data.sssp_tree.count(node) || dist < partition_data.sssp_tree[node].distance) {
+                    partition_data.sssp_tree[node] = {dist, -1}; // unknown parent from ghost
+                    pq.push({dist, node});
+                    any_update = true;
+                }
+            }
+
+            // Re-run Dijkstra locally if any new ghost update was applied
+            cout<< "[Rank " << world_rank << "]"<<"Trying djikstra again\n";
+            while (!pq.empty()) {
+                auto [dist, u] = pq.top(); pq.pop();
+                if (visited.count(u)) continue;
+                visited.insert(u);
+
+                auto it = partition_data.global_to_local.find(u);
+                if (it == partition_data.global_to_local.end()) continue;
+                idx_t local_idx = it->second;
+
+                for (idx_t i = partition_data.xadj[local_idx]; i < partition_data.xadj[local_idx + 1]; ++i) {
+                    idx_t v = partition_data.adjncy[i];
+                    int alt = dist + 1;
+
+                    if (!partition_data.sssp_tree.count(v) || alt < partition_data.sssp_tree[v].distance) {
+                        std::cout << "[Rank " << world_rank << "] Updating distance for node " << v << " to " << alt << std::endl;
+                        partition_data.sssp_tree[v] = {alt, (int)u};
+                        new_distances[v] = alt;
+                        pq.push({alt, v});
+                    }
+                }
+            }
+            cout<< "[Rank " << world_rank << "]"<<"djikstra no work\n";
+        }
+        cout<< "[Rank " << world_rank << "]"<<"Im out of this\n";
+    }
+}
+
+// File: graph_partition.cpp (add this at the end)
+void GraphPartition::gatherAndWriteSSSPToFile(const GraphPartitionData& partition_data) {
+    int world_rank, world_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    std::vector<std::tuple<idx_t, int, int>> local_entries;
+    for (const auto& [u, info] : partition_data.sssp_tree) {
+        local_entries.emplace_back(u, info.distance, info.parent);
+    }
+
+    // Serialize local entries
+    int local_count = local_entries.size();
+    std::vector<int> sendbuf(local_count * 3);
+    for (int i = 0; i < local_count; ++i) {
+        sendbuf[i * 3 + 0] = std::get<0>(local_entries[i]);
+        sendbuf[i * 3 + 1] = std::get<1>(local_entries[i]);
+        sendbuf[i * 3 + 2] = std::get<2>(local_entries[i]);
+    }
+
+    std::vector<int> recv_counts(world_size);
+    MPI_Gather(&local_count, 1, MPI_INT, recv_counts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    std::vector<int> displs;
+    std::vector<int> recvbuf;
+    if (world_rank == 0) {
+        displs.resize(world_size);
+        int total = 0;
+        for (int i = 0; i < world_size; ++i) {
+            displs[i] = total;
+            recv_counts[i] *= 3;  // Correct the receive count
+            total += recv_counts[i];
+        }
+        recvbuf.resize(total * 3);
+    }
+
+    MPI_Gatherv(sendbuf.data(), local_count * 3, MPI_INT,
+                recvbuf.data(), recv_counts.data(), displs.data(), MPI_INT,
+                0, MPI_COMM_WORLD);
+
+    if (world_rank == 0) {
+        std::vector<std::tuple<idx_t, int, int>> all_entries;
+        int total_entries = 0;
+        for (int i = 0; i < world_size; ++i) total_entries += recv_counts[i];
+
+        for (int i = 0; i < total_entries; ++i) {
+            idx_t u = recvbuf[i * 3 + 0];
+            int dist = recvbuf[i * 3 + 1];
+            int parent = recvbuf[i * 3 + 2];
+            all_entries.emplace_back(u, dist, parent);
+        }
+
+        std::sort(all_entries.begin(), all_entries.end());
+
+        std::ofstream out("update_SSSP.txt");
+        for (const auto& [u, dist, parent] : all_entries) {
+            out << u << " " << dist << " " << parent << "\n";
+        }
+        out.close();
+        if(world_rank == 0) cout<< "Written updated into update_SSSP.txt\n";
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+
+
+void GraphPartition::distributeEdgeUpdates_Insertions(const std::string& filename, 
+                                         std::vector<EdgeUpdate>& local_updates,
+                                         GraphPartitionData& partition_data) {
+    int world_rank, world_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    if (world_rank == 0) {
+        // Read updates from file and separate insertions/deletions
+        std::ifstream file(filename);
+        std::unordered_map<int, std::vector<EdgeUpdate>> updates_by_rank;
+        EdgeUpdate upd;
+        char type;
+        
+        while (file >> type >> upd.u >> upd.v) {
+            upd.is_insertion = (type == 'I');
+            upd.weight = 1;
+            
+            // Determine which ranks need this update
+            for (int r = 1; r < world_size; r++) {
+                if (partition_data.partitions[upd.u] == r-1 || 
+                    partition_data.partitions[upd.v] == r-1) {
+                    updates_by_rank[r].push_back(upd);
+                }
+            }
+        }
+
+        // Send updates to workers
+        for (int r = 1; r < world_size; r++) {
+            int count = updates_by_rank[r].size();
+            MPI_Send(&count, 1, MPI_INT, r, 100, MPI_COMM_WORLD);
+            if (count > 0) {
+                MPI_Send(updates_by_rank[r].data(), 
+                        count * sizeof(EdgeUpdate),
+                        MPI_BYTE, r, 101, MPI_COMM_WORLD);
+            }
+        }
+    } else {
+        // Receive updates
+        int update_count;
+        MPI_Recv(&update_count, 1, MPI_INT, 0, 100, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        local_updates.resize(update_count);
+        if (update_count > 0) {
+            MPI_Recv(local_updates.data(),
+                    update_count * sizeof(EdgeUpdate),
+                    MPI_BYTE, 0, 101,
+                    MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+
+        // Separate insertions and deletions
+        std::vector<EdgeUpdate> insertions, deletions;
+        for (const auto& upd : local_updates) {
+            if (upd.is_insertion) insertions.push_back(upd);
+            else deletions.push_back(upd);
+        }
+
+        // Process deletions first, then insertions
+        // if (!deletions.empty()) {
+        //     processDistributedDeletions(partition_data, deletions);
+        // }
+        if (!insertions.empty()) {
+            processDistributedInsertions(partition_data, insertions);
+        }
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+
+void GraphPartition::processDistributedInsertions(GraphPartitionData& data, const std::vector<EdgeUpdate>& insertions) {
+    int world_rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+
+    if (world_rank == 0) {
+        std::cout << "DEBUG: Starting processDistributedInsertions with " << insertions.size() << " insertions\n";
+    }
+
+    // 1. Add edges to local graph structure
+    for (const auto& upd : insertions) {
+        if (!upd.is_insertion) continue;
+
+        bool u_local = data.global_to_local.count(upd.u);
+        bool v_local = data.global_to_local.count(upd.v);
+
+        if (u_local || v_local) {
+            std::cout << "DEBUG [Rank " << world_rank << "]: Processing insertion (" << upd.u << ", " << upd.v << ")"
+                      << " - u_local: " << u_local << " v_local: " << v_local << "\n";
+
+            // Add edge to CSR structure
+            if (u_local) {
+                idx_t u_idx = data.global_to_local[upd.u];
+                data.adjncy.insert(data.adjncy.begin() + data.xadj[u_idx+1], upd.v);
+                for (size_t i = u_idx+1; i < data.xadj.size(); i++) {
+                    data.xadj[i]++;
+                }
+                std::cout << "DEBUG [Rank " << world_rank << "]: Added edge to local node " << upd.u 
+                          << " (local idx " << u_idx << ")\n";
+            }
+
+            if (v_local) {
+                idx_t v_idx = data.global_to_local[upd.v];
+                data.adjncy.insert(data.adjncy.begin() + data.xadj[v_idx+1], upd.u);
+                for (size_t i = v_idx+1; i < data.xadj.size(); i++) {
+                    data.xadj[i]++;
+                }
+                std::cout << "DEBUG [Rank " << world_rank << "]: Added edge to local node " << upd.v 
+                          << " (local idx " << v_idx << ")\n";
+            }
+
+            if (data.global_to_local.count(upd.u) && !data.sssp_tree.count(upd.u)) {
+                data.sssp_tree[upd.u] = {INF, -1};
+            }
+
+            if (data.global_to_local.count(upd.v) && !data.sssp_tree.count(upd.v)) {
+                data.sssp_tree[upd.v] = {INT_MAX, -1};
+            }
+
+            // Update ghost nodes if needed
+            if (u_local && !v_local) {
+                data.ghost_nodes[upd.v] = data.partitions[upd.v];
+                data.send_map[data.ghost_nodes[upd.v]].push_back(upd.v);
+                std::cout << "DEBUG [Rank " << world_rank << "]: Added ghost node " << upd.v 
+                          << " (owned by rank " << data.ghost_nodes[upd.v] << ")\n";
+            }
+            if (v_local && !u_local) {
+                data.ghost_nodes[upd.u] = data.partitions[upd.u];
+                data.send_map[data.ghost_nodes[upd.u]].push_back(upd.u);
+                std::cout << "DEBUG [Rank " << world_rank << "]: Added ghost node " << upd.u 
+                          << " (owned by rank " << data.ghost_nodes[upd.u] << ")\n";
+            }
+        }
+    }
+
+    // 2. Initialize priority queue with ALL potentially affected nodes
+    std::priority_queue<std::pair<int, idx_t>, 
+                       std::vector<std::pair<int, idx_t>>,
+                       std::greater<>> pq;
+
+    for (const auto& upd : insertions) {
+        if (!upd.is_insertion) continue;
+
+        if (data.global_to_local.count(upd.u) && data.sssp_tree.count(upd.u)) {
+            pq.push({data.sssp_tree[upd.u].distance, upd.u});
+            std::cout << "DEBUG [Rank " << world_rank << "]: Enqueued local node " << upd.u 
+                      << " with distance " << data.sssp_tree[upd.u].distance << "\n";
+        }
+        
+        if (data.global_to_local.count(upd.v) && data.sssp_tree.count(upd.v)) {
+            pq.push({data.sssp_tree[upd.v].distance, upd.v});
+            std::cout << "DEBUG [Rank " << world_rank << "]: Enqueued local node " << upd.v 
+                      << " with distance " << data.sssp_tree[upd.v].distance << "\n";
+        }
+        
+        // Enqueue neighbors of inserted edges
+        if (data.global_to_local.count(upd.u)) {
+            idx_t u_local = data.global_to_local[upd.u];
+            for (idx_t i = data.xadj[u_local]; i < data.xadj[u_local+1]; i++) {
+                idx_t neighbor = data.adjncy[i];
+                if (data.sssp_tree.count(neighbor)) {
+                    pq.push({data.sssp_tree[neighbor].distance, neighbor});
+                    std::cout << "DEBUG [Rank " << world_rank << "]: Enqueued neighbor " << neighbor 
+                              << " of node " << upd.u << " with distance " << data.sssp_tree[neighbor].distance << "\n";
+                }
+            }
+        }
+        if (data.global_to_local.count(upd.v)) {
+            idx_t v_local = data.global_to_local[upd.v];
+            for (idx_t i = data.xadj[v_local]; i < data.xadj[v_local+1]; i++) {
+                idx_t neighbor = data.adjncy[i];
+                if (data.sssp_tree.count(neighbor)) {
+                    pq.push({data.sssp_tree[neighbor].distance, neighbor});
+                    std::cout << "DEBUG [Rank " << world_rank << "]: Enqueued neighbor " << neighbor 
+                              << " of node " << upd.v << " with distance " << data.sssp_tree[neighbor].distance << "\n";
+                }
+            }
+        }
+    }
+
+    // 3. Process updates until no more improvements can be made
+    std::unordered_map<idx_t, int> last_processed;
+    while (!pq.empty()) {
+        auto [dist_u, u] = pq.top(); pq.pop();
+        
+        if (last_processed.count(u) && last_processed[u] < dist_u) {
+            std::cout << "DEBUG [Rank " << world_rank << "]: Skipping node " << u 
+                      << " as better distance (" << last_processed[u] << ") exists\n";
+            continue;
+        }
+        last_processed[u] = dist_u;
+
+        if (!data.global_to_local.count(u)) {
+            std::cout << "DEBUG [Rank " << world_rank << "]: Node " << u << " is not local, skipping\n";
+            continue;
+        }
+        
+        idx_t u_local = data.global_to_local[u];
+        std::cout << "DEBUG [Rank " << world_rank << "]: Processing node " << u 
+                  << " (local idx " << u_local << ") with current distance " << dist_u << "\n";
+
+        // Relax all edges
+        for (idx_t i = data.xadj[u_local]; i < data.xadj[u_local+1]; i++) {
+            idx_t v = data.adjncy[i];
+            int new_dist = dist_u + 1;
+
+            std::cout << "DEBUG [Rank " << world_rank << "]: Checking edge to " << v 
+                      << " with potential new distance " << new_dist << "\n";
+
+            // Update local nodes
+            if (data.global_to_local.count(v)) {
+                if (!data.sssp_tree.count(v) || new_dist < data.sssp_tree[v].distance) {
+                    data.sssp_tree[v] = {new_dist, (int)u};
+                    pq.push({new_dist, v});
+                    std::cout << "DEBUG [Rank " << world_rank << "]: Updated local node " << v 
+                              << " to distance " << new_dist << " via parent " << u << "\n";
+                }
+            }
+            // Handle ghost nodes (send updates to their owners)
+            else if (data.ghost_nodes.count(v)) {
+                int owner = data.ghost_nodes[v];
+                int msg[3] = {v, new_dist, u};
+                MPI_Send(msg, 3, MPI_INT, owner, 200, MPI_COMM_WORLD);
+                std::cout << "3. DEBUG [Rank " << world_rank << "]: Sent ghost update to rank " << owner 
+                          << " for node " << v << " (new_dist: " << new_dist << ", parent: " << u << ")\n";
+            }
+        }
+    }
+
+    int attempts = 0;
+    const int max_attempts = 100; 
+
+    // 4. Process incoming ghost updates (this is where ghost nodes get updates)
+    std::cout << "Rank " << world_rank << " entering ghost update loop\n";
+    MPI_Status status;
+    int flag;
+    int max_iterations = 100000;
+    int iteration = 0;
+    while (iteration++ < max_iterations) {
+        MPI_Iprobe(MPI_ANY_SOURCE, 200, MPI_COMM_WORLD, &flag, &status);
+        if (!flag) {
+            attempts++;  // Increment if no message
+            continue;
+        }
+        
+        attempts = 0; 
+
+        int msg[3];
+        MPI_Recv(msg, 3, MPI_INT, status.MPI_SOURCE, 200, MPI_COMM_WORLD, &status);
+        idx_t node = msg[0];
+        int new_dist = msg[1];
+        int parent = msg[2];
+
+        std::cout << "4. DEBUG [Rank " << world_rank << "]: Received ghost update for node " << node 
+                  << " from rank " << status.MPI_SOURCE << " (new_dist: " << new_dist << ", parent: " << parent << ")\n";
+
+        if (!data.sssp_tree.count(node)) {
+            std::cout << "[RANKKKK " << world_rank << "]: Node " << node << " is not in sssp_tree yet\n";
+        } else {
+            std::cout << "[RANKKK " << world_rank << "]: Old distance: " << data.sssp_tree[node].distance << std::endl;
+        }
+
+        if (!data.sssp_tree.count(node) || new_dist <= data.sssp_tree[node].distance) {
+            data.sssp_tree[node] = {new_dist, parent};
+            std::cout << "DEBUG [Rank " << world_rank << "]: Updated node " << node 
+                      << " to distance " << new_dist << " via parent " << parent << "\n";
+            
+            // If this node is local to current rank (ghost to sender)
+            if (data.global_to_local.count(node)) {
+                pq.push({new_dist, node});
+                std::cout << "DEBUG [Rank " << world_rank << "]: Enqueued local node " << node 
+                          << " for further processing\n";
+            }
+        }
+    }
+}
 
   //////////////////////////////////////////////////////////////////////////////////////////
     //////////////////////////////////////////////////////////////////////////////////////////
