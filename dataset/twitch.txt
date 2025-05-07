@@ -1,0 +1,2 @@
+For the Twitch-gamers dataset:
+https://snap.stanford.edu/data/twitch_gamers.html
