@@ -38,8 +38,7 @@ This project implements a **parallel dynamic Single-Source Shortest Paths (SSSP)
 ## Datasets
 
 We use real public graphs:
-- [SNAP: BHJ, Orkut](https://snap.stanford.edu/data/)
-- Synthetic RMAT graphs (Graph500)
+- [SNAP: facebook, twitch, email](https://snap.stanford.edu/data/)
 - Custom edge-weighted test graphs (soon)
 
 [Use the following link to download them](https://drive.google.com/drive/folders/1xWA5EUnzGv_pB71-b9JpQfxfZaAHuFDm?usp=sharing)
