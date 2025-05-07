@@ -41,9 +41,8 @@ if __name__ == "__main__":
 
     import os
 
-    dataset_path = os.path.join("..", "dataset", "facebook", "facebook_combined.txt")
-    output_path = os.path.join("..", "dataset", "facebook")
-    metis_output = output_path + "\\facebook_combined.graph"
+    dataset_path = os.path.join("..", "dataset", "politicians", "politicians.txt")
+    metis_output = os.path.join("..", "dataset", "politicians", "politicians.graph")
 
     convert_to_metis(dataset_path, metis_output)
   

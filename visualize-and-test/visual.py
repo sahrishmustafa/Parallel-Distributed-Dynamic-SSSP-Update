@@ -111,10 +111,10 @@ if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     # Construct paths
-    graph_path = os.path.join(script_dir, '..', 'dataset', 'facebook', 'facebook_combined.txt')
-    insertions_path = os.path.join(script_dir, '..', 'dataset', 'facebook', 'insertions.txt')
-    deletions_path = os.path.join(script_dir, '..', 'dataset', 'facebook', 'deletions.txt')
-    output_dir = os.path.join(script_dir, '..','visualize-and-test', 'output')
+    graph_path = os.path.join(script_dir, '..', 'dataset', 'dataset1', 'graph.txt')
+    insertions_path = os.path.join(script_dir, '..', 'dataset', 'dataset1', 'insertions.txt')
+    deletions_path = os.path.join(script_dir, '..', 'dataset', 'dataset1', 'deletions.txt')
+    output_dir = os.path.join(script_dir, '..','testing_visuals', 'output')
     os.makedirs(output_dir, exist_ok=True)
     
     # Read graph data
